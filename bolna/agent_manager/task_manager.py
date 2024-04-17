@@ -175,8 +175,10 @@ class TaskManager(BaseManager):
             logger.info(f"minimum wait duration {self.minimum_wait_duration}")
             self.last_spoken_timestamp = time.time() * 1000
             self.incremental_delay = task.get("incremental_delay", 100)
-            self.required_delay_before_speaking = self.minimum_wait_duration - self.incremental_delay #Everytime we get a message we increase it by 100 miliseconds 
+            self.required_delay_before_speaking = max(self.minimum_wait_duration - self.incremental_delay, 500) #Everytime we get a message we increase it by 100 miliseconds 
+            logger.info(f"required delay before speaking {self.required_delay_before_speaking}, incremental delay {self.required_delay_before_speaking}")
             self.time_since_first_interim_result  = -1
+            self.should_transmit = True
 
         #Cut conversation
         self.hang_conversation_after = task.get("hangup_after_silence", 10)
@@ -193,8 +195,10 @@ class TaskManager(BaseManager):
         self.number_of_words_for_interruption = task.get("number_of_words_for_interruption", 3)
         self.started_transmitting_audio = False
         self.interruption_backoff_period = task.get("interruption_backoff_period", 300) #this is the amount of time output loop will sleep before sending next audio
+        logger.info(f"interruption backoff period {self.interruption_backoff_period}")
         self.use_llm_for_hanging_up = task.get("hangup_after_LLMCall", False)
         self.allow_extra_sleep = False #It'll help us to back off as soon as we hear interruption for a while
+
         
     def __setup_output_handlers(self, connected_through_dashboard, output_queue):
         output_kwargs = {"websocket": self.websocket}  
@@ -784,6 +788,7 @@ class TaskManager(BaseManager):
                         meta_info = message['meta_info']
                         transcriber_message = ""
                         self.let_remaining_audio_pass_through = True 
+                        self.should_transmit = True
 
                         if self.nitro:
                             logger.info(f"#### Resetting time since first interim result")
@@ -794,8 +799,8 @@ class TaskManager(BaseManager):
                         if transcriber_message.strip() == message['data'].strip():
                             logger.info(f"###### Transcriber message and message data are same and hence not changing anything else. Probably just an is_final thingy. {message}")
                             continue
-
                         elif len(message['data'].strip()) != 0:
+                            self.should_transmit = False
                             #Currently simply cancel the next task
                             num_words += len(transcriber_message.split(" "))
 
@@ -818,6 +823,7 @@ class TaskManager(BaseManager):
                             # This means we are generating response from an interim transcript 
                             # Hence we transmit quickly 
                             if not self.started_transmitting_audio:
+                                logger.info(f"##### Ended transmitting audio and hence cleaning up down stream task")
                                 await self.__cleanup_downstream_tasks()
                             
                             # If we've started transmitting audio this is probably an interruption, so calculate number of words
@@ -1042,7 +1048,7 @@ class TaskManager(BaseManager):
                     self.allow_extra_sleep = False
                     prev_message = current_message
 
-                if self.nitro and not self.let_remaining_audio_pass_through:
+                if self.nitro and not self.let_remaining_audio_pass_through and not self.should_transmit:
                     time_since_first_interim_result = (time.time() *1000)- self.time_since_first_interim_result if self.time_since_first_interim_result != -1 else -1
                     if  time_since_first_interim_result != -1 and time_since_first_interim_result < self.required_delay_before_speaking:
                         logger.info(f"##### It's been {time_since_first_interim_result} ms since first  interim result and required time to wait for it is {self.required_delay_before_speaking}. Hence sleeping for 100ms. self.time_since_first_interim_result {self.time_since_first_interim_result}")
@@ -1112,7 +1118,7 @@ class TaskManager(BaseManager):
                 # Sleep until this particular audio frame is spoken only if the duration for the frame is atleast 500ms
                 if duration > 0.3:
                     logger.info(f"##### Sleeping for {duration - 0.03} to maintain quueue on our side")
-                    await asyncio.sleep(duration-0.03) #30 milliseconds less
+                    await asyncio.sleep(duration- 0.03) #30 milliseconds less
                     
                 self.last_transmitted_timesatamp = time.time()
                 logger.info(f"##### Updating Last transmitted timestamp to {self.last_transmitted_timesatamp}")

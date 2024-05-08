@@ -28,7 +28,8 @@ SUPPORTED_LLM_PROVIDERS = {
     'perplexity': LiteLLM,
     'vllm': OpenAiLLM,
     'anyscale': LiteLLM,
-    'custom': OpenAiLLM
+    'custom': OpenAiLLM,
+    "anthropic": LiteLLM
 }
 SUPPORTED_INPUT_HANDLERS = {
     'default': DefaultInputHandler,

@@ -2,7 +2,6 @@ import asyncio
 from collections import defaultdict
 import math
 import os
-import random
 import traceback
 import time
 import json
@@ -11,14 +10,13 @@ import copy
 from datetime import datetime
 
 from bolna.constants import ACCIDENTAL_INTERRUPTION_PHRASES
-from bolna.memory.cache.inmemory_scalar_cache import InmemoryScalarCache
 from bolna.memory.cache.vector_cache import VectorCache
 from .base_manager import BaseManager
 from bolna.agent_types import *
 from bolna.providers import *
 from bolna.prompts import *
-from bolna.helpers.utils import calculate_audio_duration, create_ws_data_packet, get_file_names_in_directory, get_raw_audio_bytes, is_valid_md5, \
-    get_required_input_types, format_messages, get_prompt_responses, resample, save_audio_file_to_s3, update_prompt_with_context, get_md5_hash, clean_json_string, wav_bytes_to_pcm, convert_to_request_log, yield_chunks_from_memory
+from bolna.helpers.utils import calculate_audio_duration, create_ws_data_packet, get_raw_audio_bytes, is_valid_md5, \
+    get_required_input_types, format_messages, clean_json_string, wav_bytes_to_pcm, convert_to_request_log, yield_chunks_from_memory
 from bolna.helpers.logger_config import configure_logger
 from semantic_router import Route
 from semantic_router.layer import RouteLayer
@@ -60,6 +58,8 @@ class TaskManager(BaseManager):
         self.enforce_streaming = kwargs.get("enforce_streaming", False)
         self.callee_silent = True
         self.yield_chunks = yield_chunks
+        self.minimum_wait_duration = 0
+        self.required_delay_before_speaking = 0
         # Set up communication queues between processes
         self.audio_queue = asyncio.Queue()
         self.llm_queue = asyncio.Queue()
@@ -85,7 +85,8 @@ class TaskManager(BaseManager):
         self.conversation_ended = False
 
         # Prompts
-        self.prompts, self.system_prompt = {}, {}
+        self.prompts = "Just talk to me" 
+        self.system_prompt = "You are a phone bot"
         self.input_parameters = input_parameters
         
         # Recording
@@ -214,7 +215,7 @@ class TaskManager(BaseManager):
 
         # for long pauses and rushing
             if conversation_config is not None:
-                self.minimum_wait_duration = self.task_config["tools_config"]["transcriber"]["endpointing"]
+                self.minimum_wait_duration = 5
                 logger.info(f"minimum wait duration {self.minimum_wait_duration}")
                 self.last_spoken_timestamp = time.time() * 1000
                 self.incremental_delay = conversation_config.get("incremental_delay", 100)
@@ -246,38 +247,13 @@ class TaskManager(BaseManager):
                 #self.interruption_backoff_period = 1000 #conversation_config.get("interruption_backoff_period", 300) #this is the amount of time output loop will sleep before sending next audio
                 self.use_llm_for_hanging_up = conversation_config.get("hangup_after_LLMCall", False)
                 self.allow_extra_sleep = False #It'll help us to back off as soon as we hear interruption for a while
-
-                #Backchanneling
-                self.should_backchannel = conversation_config.get("backchanneling", False)
-                self.backchanneling_task = None
-                self.backchanneling_start_delay = conversation_config.get("backchanneling_start_delay", 5)
-                self.backchanneling_message_gap = conversation_config.get("backchanneling_message_gap", 2) #Amount of duration co routine will sleep
-                if self.should_backchannel and not connected_through_dashboard and task_id == 0:
-                    logger.info(f"Should backchannel")
-                    self.backchanneling_audios = f'{kwargs.get("backchanneling_audio_location", os.getenv("BACKCHANNELING_PRESETS_DIR"))}/{self.synthesizer_voice.lower()}'
-                    #self.num_files = list_number_of_wav_files_in_directory(self.backchanneling_audios)
-                    try:
-                        self.filenames = get_file_names_in_directory(self.backchanneling_audios)
-                        logger.info(f"Backchanneling audio location {self.backchanneling_audios}")
-                    except Exception as e:
-                        logger.info(f"Something went wrong an putting should backchannel to false")
-                        self.should_backchannel = False
-                else:
-                    logger.info(f"Not setting up backchanneling")
-                    self.backchanneling_audio_map = []
+               
                 # Agent welcome message
                 if "agent_welcome_message" in self.kwargs:
                     logger.info(f"Agent welcome message present {self.kwargs['agent_welcome_message']}")
                     self.first_message_task = None
                     self.transcriber_message = ''
                 
-                # Ambient noise
-                self.ambient_noise = conversation_config.get("ambient_noise", False)
-                self.ambient_noise_task = None
-                if self.ambient_noise:
-                    logger.info(f"Ambient noise is True {self.ambient_noise}")
-                    self.soundtrack = f"{conversation_config.get('ambient_noise_track', 'convention_hall')}.wav"
-
     def __setup_routes(self, routes):
         embedding_model = routes.get("embedding_model", os.getenv("ROUTE_EMBEDDING_MODEL"))
         self.route_encoder = FastEmbedEncoder(name=embedding_model)
@@ -450,62 +426,6 @@ class TaskManager(BaseManager):
     ########################
     # Helper methods
     ########################
-    async def load_prompt(self, assistant_name, task_id, local, **kwargs):
-        logger.info("prompt and config setup started")
-        if self.task_config["task_type"] == "webhook":
-            return
-        self.is_local = local
-        today = datetime.now().strftime("%A, %B %d, %Y")
-        if "prompt" in self.task_config["tools_config"]["llm_agent"]:
-            #This will be tre when we have extraction or maybe never
-            self.prompts = {
-                "system_prompt": f'{self.task_config["tools_config"]["llm_agent"]["prompt"]} \n### Date\n Today\'s Date is {today}'
-            }
-            logger.info(f"Prompt given in llm_agent and hence storing the prompt")
-        else:
-            prompt_responses = kwargs.get('prompt_responses', None)
-            if not prompt_responses:
-                prompt_responses = await get_prompt_responses(assistant_id=self.assistant_id, local=self.is_local)
-            current_task = "task_{}".format(task_id + 1)
-            self.prompts = self.__prefill_prompts(self.task_config, prompt_responses.get(current_task, None), self.task_config['task_type'])
-            if self.task_config["tools_config"]["llm_agent"]['agent_flow_type'] == "preprocessed":
-                self.tools["llm_agent"].load_prompts_and_create_graph(self.prompts)
-
-        if "system_prompt" in self.prompts:
-            # This isn't a graph based agent
-            enriched_prompt = self.prompts["system_prompt"]
-            logger.info("There's a system prompt")
-            if self.context_data is not None:
-                enriched_prompt = update_prompt_with_context(self.prompts["system_prompt"], self.context_data)
-                self.prompts["system_prompt"] = enriched_prompt
-            self.system_prompt = {
-                'role': "system",
-                'content': f"{enriched_prompt}\n### Date\n Today\'s Date is {today}"
-            }
-        else:
-            self.system_prompt = {
-                'role': "system",
-                'content': ""
-            }
-        
-        if len(self.system_prompt['content']) == 0:
-            self.history = [] if len(self.history) == 0 else self.history
-        else:
-            self.history = [self.system_prompt] if len(self.history) == 0 else [self.system_prompt] + self.history
-
-        self.interim_history = copy.deepcopy(self.history)
-
-    def __prefill_prompts(self, task, prompt, task_type):
-        if not prompt and task_type in ('extraction', 'summarization'):
-            if task_type == 'extraction':
-                extraction_json = task.get("tools_config").get('llm_agent').get('extraction_json')
-                prompt = EXTRACTION_PROMPT.format(extraction_json)
-                return {"system_prompt": prompt}
-            elif task_type == 'summarization':
-                return {"system_prompt": SUMMARIZATION_PROMPT}
-
-        return prompt
-
     def __process_stop_words(self, text_chunk, meta_info):
          #THis is to remove stop words. Really helpful in smaller 7B models
         if "end_of_llm_stream" in meta_info and meta_info["end_of_llm_stream"] and "user" in text_chunk[-5:].lower():
@@ -1150,52 +1070,42 @@ class TaskManager(BaseManager):
         try:
             #TODO: Either load IVR audio into memory before call or user s3 iter_cunks
             # This will help with interruption in IVR
-            if self.connected_through_dashboard or self.task_config['tools_config']['output'] == "default":
-                audio_chunk = await get_raw_audio_bytes(text, self.assistant_name,
-                                                                self.task_config["tools_config"]["output"][
-                                                                    "format"], local=self.is_local,
-                                                                assistant_id=self.assistant_id)
-                logger.info("Sending preprocessed audio")
-                meta_info["format"] = self.task_config["tools_config"]["output"]["format"]
-                await self.tools["output"].handle(create_ws_data_packet(audio_chunk, meta_info))
-                e
-            else:
-                audio_chunk = await get_raw_audio_bytes(text, self.assistant_name,
-                                                                'pcm', local=self.is_local,
-                                                                assistant_id=self.assistant_id)
-                if not self.buffered_output_queue.empty():
-                    logger.info(f"Output queue was not empty and hence emptying it")
-                    self.buffered_output_queue = asyncio.Queue()
-                meta_info["format"] = "pcm"
-                if 'message_category' in meta_info and meta_info['message_category'] == "agent_welcome_message":
-                    if audio_chunk is None:
-                        logger.info(f"File doesn't exist in S3. Hence we're synthesizing it from synthesizer")
-                        meta_info['cached'] = False
-                        await self._synthesize(create_ws_data_packet(meta_info['text'], meta_info= meta_info))
-                    else:
-                        logger.info(f"Sending the agent welcome message")
-                        number_of_chunks = math.ceil(len(audio_chunk)/self.output_chunk_size)
-                        i = 0
-                        logger.info(f"Audio chunk size {len(audio_chunk)}, chunk size {self.output_chunk_size}")
-                        meta_info['is_first_chunk'] = True
-                        for chunk in yield_chunks_from_memory(audio_chunk, chunk_size=self.output_chunk_size):
-                            self.__enqueue_chunk(chunk, i, number_of_chunks, meta_info)
-                            i +=1
-
-                elif self.yield_chunks:
-                    logger.info(f"Sending the preprocessed message")
+            audio_chunk = await get_raw_audio_bytes(text, self.assistant_name,
+                                                    'pcm', local=self.is_local,
+                                                    assistant_id=self.assistant_id)
+            if not self.buffered_output_queue.empty():
+                logger.info("Output queue was not empty and hence emptying it")
+                self.buffered_output_queue = asyncio.Queue()
+            meta_info["format"] = "pcm"
+            if 'message_category' in meta_info and meta_info['message_category'] == "agent_welcome_message":
+                if audio_chunk is None:
+                    logger.info("File doesn't exist in S3. Hence we're synthesizing it from synthesizer")
+                    meta_info['cached'] = False
+                    await self._synthesize(create_ws_data_packet(meta_info['text'], meta_info= meta_info))
+                else:
+                    logger.info("Sending the agent welcome message")
                     number_of_chunks = math.ceil(len(audio_chunk)/self.output_chunk_size)
                     i = 0
+                    logger.info("Audio chunk size {len(audio_chunk)}, chunk size {self.output_chunk_size}")
                     meta_info['is_first_chunk'] = True
-                    logger.info(f"Audio chunk size {len(audio_chunk)}, chunk size {self.output_chunk_size}")
                     for chunk in yield_chunks_from_memory(audio_chunk, chunk_size=self.output_chunk_size):
                         self.__enqueue_chunk(chunk, i, number_of_chunks, meta_info)
                         i +=1
 
-                else:
-                    message = create_ws_data_packet(audio_chunk, meta_info)
-                    logger.info(f"Yield in chunks is false and hence sending a full")
-                    self.buffered_output_queue.put_nowait(message)
+            elif self.yield_chunks:
+                logger.info("Sending the preprocessed message")
+                number_of_chunks = math.ceil(len(audio_chunk)/self.output_chunk_size)
+                i = 0
+                meta_info['is_first_chunk'] = True
+                logger.info(f"Audio chunk size {len(audio_chunk)}, chunk size {self.output_chunk_size}")
+                for chunk in yield_chunks_from_memory(audio_chunk, chunk_size=self.output_chunk_size):
+                    self.__enqueue_chunk(chunk, i, number_of_chunks, meta_info)
+                    i +=1
+
+            else:
+                message = create_ws_data_packet(audio_chunk, meta_info)
+                logger.info("Yield in chunks is false and hence sending a full")
+                self.buffered_output_queue.put_nowait(message)
         except Exception as e:
             traceback.print_exc()
             logger.error(f"Something went wrong {e}")
@@ -1213,7 +1123,7 @@ class TaskManager(BaseManager):
                     
                 elif self.synthesizer_provider in SUPPORTED_SYNTHESIZER_MODELS.keys():
                     # self.sequence_ids.add(meta_info["sequence_id"])
-                    # logger.info(f"After adding into sequence id {self.sequence_ids}")
+                    logger.info(f"After adding into sequence id {self.sequence_ids}")
                     convert_to_request_log(message = text, meta_info= meta_info, component="synthesizer", direction="request", model = self.synthesizer_provider, engine=self.tools['synthesizer'].get_engine(), run_id= self.run_id)
                     logger.info('##### sending text to {} for generation: {} '.format(self.synthesizer_provider, text))
                     if 'cached' in message['meta_info'] and meta_info['cached'] is True:
@@ -1387,20 +1297,6 @@ class TaskManager(BaseManager):
             else:
                 logger.info(f"Only {time_since_last_spoken_AI_word} seconds since last spoken time stamp and hence not cutting the phone call")
     
-    async def __check_for_backchanneling(self):
-        while True:
-            if self.callee_speaking and time.time() - self.callee_speaking_start_time > self.backchanneling_start_delay:
-                filename = random.choice(self.filenames)
-                logger.info(f"Should send a random backchanneling words and sending them {filename}")
-                audio = await get_raw_audio_bytes(f"{self.backchanneling_audios}/{filename}", local= True, is_location=True)
-                if not self.connected_through_dashboard and self.task_config['tools_config']['output'] != "default":
-                    audio = resample(audio, target_sample_rate= 8000, format="wav")
-                    audio = wav_bytes_to_pcm(audio)
-                await self.tools["output"].handle(create_ws_data_packet(audio, self.__get_updated_meta_info())) 
-            else:
-                logger.info(f"Callee isn't speaking and hence not sending or {time.time() - self.callee_speaking_start_time} is not greater than {self.backchanneling_start_delay}") 
-            await asyncio.sleep(self.backchanneling_message_gap) 
-    
     async def __first_message(self):
         logger.info(f"Executing the first message task")
         try:
@@ -1426,29 +1322,6 @@ class TaskManager(BaseManager):
 
         except Exception as e:
             logger.error(f"Error happeneed {e}")
-
-    async def __start_transmitting_ambient_noise(self):
-        try:
-            audio = await get_raw_audio_bytes(f'{os.getenv("AMBIENT_NOISE_PRESETS_DIR")}/{self.soundtrack}', local= True, is_location=True)
-            audio = resample(audio, self.sampling_rate, format = "wav")
-            if self.task_config["tools_config"]["output"]["provider"] in SUPPORTED_OUTPUT_TELEPHONY_HANDLERS.keys():
-                audio = wav_bytes_to_pcm(audio)
-            logger.info(f"Length of audio {len(audio)} {self.sampling_rate}")
-            if self.should_record:
-                meta_info={'io': 'default', 'message_category': 'ambient_noise', "request_id": str(uuid.uuid4()), "sequence_id": -1, "type":'audio', 'format': 'wav'}
-            else:
-
-                meta_info={'io': 'twilio', 'message_category': 'ambient_noise', 'stream_sid': self.stream_sid , "request_id": str(uuid.uuid4()), "cached": True, "type":'audio', "sequence_id": -1, 'format': 'pcm'}
-            while True:
-                logger.info(f"Before yielding ambient noise")
-                for chunk in yield_chunks_from_memory(audio, self.output_chunk_size*2 ):
-                    if not self.started_transmitting_audio:
-                        logger.info(f"Transmitting ambient noise {len(chunk)}")
-                        await self.tools["output"].handle(create_ws_data_packet(chunk, meta_info=meta_info))
-                    logger.info("Sleeping for 800 ms")
-                    await asyncio.sleep(0.5)
-        except Exception as e:
-            logger.error(f"Something went wrong while transmitting noise {e}")
 
     async def run(self):
         try:
@@ -1483,11 +1356,6 @@ class TaskManager(BaseManager):
                         self.first_message_task = asyncio.create_task(self.__first_message())
                         if not self.use_llm_to_determine_hangup :
                             self.hangup_task = asyncio.create_task(self.__check_for_completion())
-                        if self.should_backchannel:
-                            self.backchanneling_task = asyncio.create_task(self.__check_for_backchanneling())
-                        if self.ambient_noise:
-                            logger.info(f"Transmitting ambient noise")
-                            self.ambient_noise_task = asyncio.create_task(self.__start_transmitting_ambient_noise())
                 try:
                     await asyncio.gather(*tasks)
                 except asyncio.CancelledError as e:
@@ -1531,21 +1399,12 @@ class TaskManager(BaseManager):
             if self._is_conversation_task():
                 self.output_task.cancel()
             
-            if self._is_conversation_task() and self.backchanneling_task is not None:
-                self.backchanneling_task.cancel()
-            
-            if self._is_conversation_task() and self.ambient_noise_task is not None:
-                self.ambient_noise_task.cancel()
-            
             if self.task_id == 0:
                 output = {"messages": self.history, "conversation_time": time.time() - self.start_time,
                           "label_flow": self.label_flow, "call_sid": self.call_sid, "stream_sid": self.stream_sid,
                           "transcriber_duration": self.transcriber_duration,
                           "synthesizer_characters": self.tools['synthesizer'].get_synthesized_characters(), "ended_by_assistant": self.ended_by_assistant,
                           "latency_dict": self.latency_dict}
-
-                if self.should_record:
-                    output['recording_url'] = await save_audio_file_to_s3(self.conversation_recording, self.sampling_rate, self.assistant_id, self.run_id)
 
             else:
                 output = self.input_parameters

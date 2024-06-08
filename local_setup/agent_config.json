@@ -1,0 +1,71 @@
+
+{
+    "agent_config": {
+        "agent_name": "Jupus",
+        "agent_welcome_message": "Hello Simon, How are you?",
+        "agent_type": "other",
+        "tasks": [
+            {
+                "task_type": "conversation",
+                "tools_config": {
+                "llm_agent": {
+                    "model": "gpt-4o",
+                    "max_tokens": 500,
+                    "agent_flow_type": "streaming",
+                    "family": "openai",
+                    "provider": "openai",
+                    "base_url": "https://api.openai.com/v1",
+                    "temperature": 0.7,
+                    "request_json": true
+                },
+                "synthesizer": {
+                    "audio_format": "pcm",
+                    "provider": "deepgram",
+                    "stream": true,
+                    "provider_config": {
+                        "model": "nova-2",
+                        "voice": "en"
+                    },
+                    "buffer_size": 100.0
+                },
+                "transcriber": {
+                    "encoding": "linear16",
+                    "language": "en",
+                    "model": "deepgram",
+                    "stream": true
+                },
+                "input": {
+                    "provider": "twilio",
+                    "format": "pcm"
+                },
+                "output": {
+                    "provider": "twilio",
+                    "format": "pcm"
+                }
+            },
+            "toolchain": {
+            "execution": "parallel",
+            "pipelines": [
+                [
+                "transcriber",
+                "llm",
+                "synthesizer"
+                ]
+            ]
+            },
+            "task_config": {
+                "hangup_after_silence": 30.0,
+                "incremental_delay": 20,
+                "number_of_words_for_interruption": 50,
+                "hangup_after_LLMCall": true,
+                "call_cancellation_prompt": "Good bye"
+            }
+        }
+        ]
+    },
+    "agent_prompts": {
+        "task_1": {
+            "system_prompt": "Ask if they are coming for party tonight"
+        }
+    }
+}

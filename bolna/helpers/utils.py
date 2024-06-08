@@ -1,17 +1,14 @@
 import datetime
 import json
 import asyncio
-import math
 import re
 import copy
 import hashlib
 import os
-import traceback
 import io
 import wave
 import numpy as np
 import aiofiles
-import torch
 import torchaudio
 from scipy.io import wavfile
 from botocore.exceptions import BotoCoreError, ClientError
@@ -25,10 +22,6 @@ from pydub import AudioSegment
 
 logger = configure_logger(__name__)
 load_dotenv()
-BUCKET_NAME = os.getenv('BUCKET_NAME')
-RECORDING_BUCKET_NAME = os.getenv('RECORDING_BUCKET_NAME')
-RECORDING_BUCKET_URL = os.getenv('RECORDING_BUCKET_URL')
-
 class DictWithMissing(dict):
     def __missing__(self, key):
         return ''
@@ -120,35 +113,6 @@ def raw_to_mulaw(raw_bytes):
     return mulaw_encoded
 
 
-async def get_s3_file(bucket_name, file_key):
-    session = AioSession()
-
-    async with AsyncExitStack() as exit_stack:
-        s3_client = await exit_stack.enter_async_context(session.create_client('s3'))
-        try:
-            response = await s3_client.get_object(Bucket=bucket_name, Key=file_key)
-        except (BotoCoreError, ClientError) as error:
-            logger.error(error)
-        else:
-            file_content = await response['Body'].read()
-            return file_content
-
-async def delete_s3_file_by_prefix(bucket_name,file_key):
-    session = AioSession()
-    async with AsyncExitStack() as exit_stack:
-        s3_client = await exit_stack.enter_async_context(session.create_client('s3'))
-        try:
-            paginator = s3_client.get_paginator('list_objects')
-            async for result in paginator.paginate(Bucket=bucket_name, Prefix=file_key):
-                tasks = []
-                for file in result.get('Contents', []):
-                    tasks.append(s3_client.delete_object(Bucket=bucket_name, Key=file['Key']))
-                await asyncio.gather(*tasks)
-            return True
-        except (BotoCoreError, ClientError) as error:
-            logger.error(error)
-            return error
-
 async def store_file(bucket_name=None, file_key=None, file_data=None, content_type="json", local=False, preprocess_dir=None):
     if not local:
         session = AioSession()
@@ -182,28 +146,16 @@ async def store_file(bucket_name=None, file_key=None, file_data=None, content_ty
                 f.write(data)
 
 
-async def get_raw_audio_bytes(filename, agent_name = None, audio_format='mp3', assistant_id=None, local = False, is_location = False):
+async def get_raw_audio_bytes(filename):
     # we are already storing pcm formatted audio in the filler config. No need to encode/decode them further
     audio_data = None
-    if local:
-        if not is_location:
-            file_name = f"{PREPROCESS_DIR}/{agent_name}/{audio_format}/{filename}.{audio_format}"
-        else:
-            file_name = filename
-        if os.path.isfile(file_name):
-            with open(file_name, 'rb') as file:
-                # Read the entire file content into a variable
-                audio_data = file.read()
-        else:
-            audio_data = None
+    file_name = filename
+    if os.path.isfile(file_name):
+        with open(file_name, 'rb') as file:
+            # Read the entire file content into a variable
+            audio_data = file.read()
     else:
-        if not is_location:
-            object_key = f"{assistant_id}/audio/{filename}.{audio_format}"
-        else:
-            object_key = filename
-            
-        logger.info(f"Reading {object_key}")
-        audio_data = await get_s3_file(BUCKET_NAME, object_key)
+        audio_data = None
 
     return audio_data
 
@@ -265,19 +217,6 @@ async def get_prompt_responses(assistant_id, local=False):
                 data = json.load(json_file)
         except Exception as e:
             logger.error(f"Could not load up the dataset {e}")
-    else:
-        key = f"{assistant_id}/conversation_details.json"
-        logger.info(f"Loading up the conversation details from the s3 file BUCKET_NAME {BUCKET_NAME} {key}")
-        try:
-            response = await get_s3_file(BUCKET_NAME, key)
-            file_content = response.decode('utf-8')
-            json_content = json.loads(file_content)
-            return json_content
-
-        except Exception as e:
-            traceback.print_exc()
-            print(f"An error occurred: {e}")
-            return None
 
     return data
 
@@ -329,18 +268,6 @@ def yield_chunks_from_memory(audio_bytes, chunk_size=512):
     total_length = len(audio_bytes)
     for i in range(0, total_length, chunk_size):
         yield audio_bytes[i:i + chunk_size]
-
-
-def pcm_to_wav_bytes(pcm_data, sample_rate = 16000, num_channels = 1, sample_width = 2):
-    buffer = io.BytesIO()
-    bit_depth = 16 
-    if len(pcm_data)%2 == 1:
-        pcm_data += b'\x00'
-    tensor_pcm = torch.frombuffer(pcm_data, dtype=torch.int16)
-    tensor_pcm = tensor_pcm.float() / (2**(bit_depth - 1))  
-    tensor_pcm = tensor_pcm.unsqueeze(0)  
-    torchaudio.save(buffer, tensor_pcm, sample_rate, format='wav')
-    return buffer.getvalue()
 
 
 def convert_audio_to_wav(audio_bytes, source_format = 'flac'):
@@ -441,63 +368,6 @@ async def write_request_logs(message, run_id):
             await log_file.write(header+log_string)
         else:
             await log_file.write(log_string)
-
-async def save_audio_file_to_s3(conversation_recording, sampling_rate = 24000, assistant_id = None, run_id = None):
-    last_frame_end_time = conversation_recording['output'][0]['start_time']
-    logger.info(f"LENGTH OF OUTPUT AUDIO {len(conversation_recording['output'])}")
-    initial_gap = (last_frame_end_time - conversation_recording["metadata"]["started"] ) *1000
-    logger.info(f"Initial gap {initial_gap}")
-    combined_audio = AudioSegment.silent(duration=initial_gap, frame_rate=sampling_rate)
-    for i, frame in enumerate(conversation_recording['output']):
-        frame_start_time =  frame['start_time']
-        logger.info(f"Processing frame {i}, fram start time = {last_frame_end_time}, frame start time= {frame_start_time}")
-        if last_frame_end_time < frame_start_time:
-            gap_duration_samples = frame_start_time - last_frame_end_time
-            silence = AudioSegment.silent(duration=gap_duration_samples*1000, frame_rate=sampling_rate)
-            combined_audio += silence
-        last_frame_end_time = frame_start_time + frame['duration']
-        frame_as = AudioSegment.from_file(io.BytesIO(frame['data']), format = "wav")
-        combined_audio +=frame_as
-
-    webm_segment = AudioSegment.from_file(io.BytesIO(conversation_recording['input']["data"]))
-    wav_bytes = io.BytesIO()
-    webm_segment.export(wav_bytes, format="wav")
-    wav_bytes.seek(0)  # Reset the pointer to the start
-    waveform, sample_rate = torchaudio.load(wav_bytes)
-    resampler = torchaudio.transforms.Resample(orig_freq=sample_rate, new_freq=sampling_rate)
-    downsampled_waveform = resampler(waveform)
-    torchaudio_wavio = io.BytesIO()
-    torchaudio.save(torchaudio_wavio, downsampled_waveform, sampling_rate, format= "wav")
-    audio_segment_bytes = io.BytesIO()
-    combined_audio.export(audio_segment_bytes, format="wav")
-    audio_segment_bytes.seek(0)
-    waveform_audio_segment, sample_rate = torchaudio.load(audio_segment_bytes)
-
-    if waveform_audio_segment.shape[0] > 1:
-        waveform_audio_segment = waveform_audio_segment[:1, :]
-
-    # Adjust shapes to be [1, N] if not already
-    downsampled_waveform = downsampled_waveform.unsqueeze(0) if downsampled_waveform.dim() == 1 else downsampled_waveform
-    waveform_audio_segment = waveform_audio_segment.unsqueeze(0) if waveform_audio_segment.dim() == 1 else waveform_audio_segment
-
-    # Ensure both waveforms have the same length
-    max_length = max(downsampled_waveform.size(1), waveform_audio_segment.size(1))
-    downsampled_waveform_padded = torch.nn.functional.pad(downsampled_waveform, (0, max_length - downsampled_waveform.size(1)))
-    waveform_audio_segment_padded = torch.nn.functional.pad(waveform_audio_segment, (0, max_length - waveform_audio_segment.size(1)))
-    stereo_waveform = torch.cat((downsampled_waveform_padded, waveform_audio_segment_padded), 0)
-
-    # Verify the stereo waveform shape is [2, M]
-    assert stereo_waveform.shape[0] == 2, "Stereo waveform should have 2 channels."
-    key = f'{assistant_id + run_id.split("#")[1]}.wav'
-
-    audio_buffer = io.BytesIO()
-    torchaudio.save(audio_buffer, stereo_waveform, 24000, format="wav")
-    audio_buffer.seek(0)
-
-    logger.info(f"Storing in {RECORDING_BUCKET_URL}{key}")
-    await store_file(bucket_name=RECORDING_BUCKET_NAME, file_key=key, file_data=audio_buffer, content_type="wav")
-    
-    return f'{RECORDING_BUCKET_URL}{key}'
 
 def list_number_of_wav_files_in_directory(directory):
     count = 0

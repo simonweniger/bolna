@@ -1,83 +1,116 @@
 import os
-import json
-import requests
+import asyncio
 import uuid
-from twilio.twiml.voice_response import VoiceResponse, Connect
-from twilio.rest import Client
-from dotenv import load_dotenv
+import traceback
+import json
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
 import redis.asyncio as redis
-from fastapi import FastAPI, HTTPException, Query, Request
+from dotenv import load_dotenv
+from bolna.helpers.utils import store_file, load_file
+from bolna.prompts import *
+from bolna.helpers.logger_config import configure_logger
+from bolna.models import *
+from bolna.llms import LiteLLM
+from bolna.agent_manager.assistant_manager import AssistantManager
+from twilio.twiml.voice_response import VoiceResponse, Connect
+from dotenv import load_dotenv
 from fastapi.responses import PlainTextResponse
 
-app = FastAPI()
+
 load_dotenv()
-port = 8001
+logger = configure_logger(__name__)
 
-twilio_account_sid = os.getenv('TWILIO_ACCOUNT_SID')
-twilio_auth_token = os.getenv('TWILIO_AUTH_TOKEN')
-twilio_phone_number = os.getenv('TWILIO_PHONE_NUMBER')
+redis_pool = redis.ConnectionPool.from_url(os.getenv('REDIS_URL'), decode_responses=True)
+redis_client = redis.Redis.from_pool(redis_pool)
+active_websockets: List[WebSocket] = []
 
-# Initialize Twilio client
-twilio_client = Client(twilio_account_sid, twilio_auth_token)
+app = FastAPI()
 
-
-def populate_ngrok_tunnels():
-    response = requests.get("http://ngrok:4040/api/tunnels")  # ngrok interface
-    app_callback_url, websocket_url = None, None
-
-    if response.status_code == 200:
-        data = response.json()
-
-        for tunnel in data['tunnels']:
-            if tunnel['name'] == 'twilio-app':
-                app_callback_url = tunnel['public_url']
-            elif tunnel['name'] == 'bolna-app':
-                websocket_url = tunnel['public_url'].replace('https:', 'wss:')
-
-        return app_callback_url, websocket_url
-    else:
-        print(f"Error: Unable to fetch data. Status code: {response.status_code}")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*", "https://polished-needlessly-monkfish.ngrok-free.app", "http://192.168.167.1:38842"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"]
+)
 
 
-@app.post('/call')
-async def make_call(request: Request):
+class CreateAgentPayload(BaseModel):
+    agent_config: AgentModel
+    agent_prompts: Optional[Dict[str, Dict[str, str]]]
+
+
+@app.post("/agent")
+async def create_agent(agent_data: CreateAgentPayload):
+    agent_uuid = str(uuid.uuid4())
+    data_for_db = agent_data.agent_config.model_dump()
+    data_for_db["assistant_status"] = "seeding"
+    agent_prompts = agent_data.agent_prompts
+    logger.info(f'Data for DB {data_for_db}')
+
+    if len(data_for_db['tasks']) > 0:
+        logger.info("Setting up follow up tasks")
+        for index, task in enumerate(data_for_db['tasks']):
+            if task['task_type'] == "extraction":
+                extraction_prompt_llm = os.getenv("EXTRACTION_PROMPT_GENERATION_MODEL")
+                extraction_prompt_generation_llm = LiteLLM(model=extraction_prompt_llm, max_tokens=2000)
+                extraction_prompt = await extraction_prompt_generation_llm.generate(
+                    messages=[
+                        {'role': 'system', 'content': EXTRACTION_PROMPT_GENERATION_PROMPT},
+                        {'role': 'user', 'content': data_for_db["tasks"][index]['tools_config']["llm_agent"]['extraction_details']}
+                    ])
+                data_for_db["tasks"][index]["tools_config"]["llm_agent"]['extraction_json'] = extraction_prompt
+
+    stored_prompt_file_path = f"{agent_uuid}/conversation_details.json"
+    await asyncio.gather(
+        redis_client.set(agent_uuid, json.dumps(data_for_db)),
+        store_file(file_key=stored_prompt_file_path, file_data=agent_prompts, local=True)
+    )
+
+    return {"agent_id": agent_uuid, "state": "created"}
+
+
+############################################################################################# 
+# Websocket 
+#############################################################################################
+@app.websocket("/chat")
+async def websocket_endpoint(websocket: WebSocket):
+    logger.info("Attempting to connect to WebSocket")
     try:
-        call_details = await request.json()
-        agent_id = call_details.get('agent_id', None)
-
-        if not agent_id:
-            raise HTTPException(status_code=404, detail="Agent not provided")
-        
-        if not call_details or "recipient_phone_number" not in call_details:
-            raise HTTPException(status_code=404, detail="Recipient phone number not provided")
-
-        app_callback_url, websocket_url = populate_ngrok_tunnels()
-
-        print(f'app_callback_url: {app_callback_url}')
-        print(f'websocket_url: {websocket_url}')
-
-        call = twilio_client.calls.create(
-            to=call_details.get('recipient_phone_number'),
-            from_=twilio_phone_number,
-            url=f"{app_callback_url}/twilio_callback?ws_url={websocket_url}&agent_id={agent_id}",
-            method="POST",
-            record=False
-        )
-
-        return PlainTextResponse("done", status_code=200)
-
+        await websocket.accept()
+        logger.info("WebSocket connection accepted")
     except Exception as e:
-        print(f"Exception occurred in make_call: {e}")
-        raise HTTPException(status_code=500, detail="Internal Server Error")
+        logger.error(f"Error accepting WebSocket connection: {e}")
+        return
 
+    active_websockets.append(websocket)
+    agent_config, context_data = None, None
+    agent_config = load_file('./local_setup/agent_config.json', is_json=True)
+    logger.info(f"Retrieved agent config: {agent_config}")
 
-@app.post('/twilio_callback')
-async def twilio_callback(ws_url: str = Query(...), agent_id: str = Query(...)):
+    assistant_manager = AssistantManager(agent_config, websocket)
+    
+    logger.info(f"Assistant Manager: {assistant_manager}")
+    try:
+        async for index, task_output in assistant_manager.run(local=True):
+            logger.info(task_output)
+    except WebSocketDisconnect:
+        active_websockets.remove(websocket)
+        logger.info("WebSocket disconnected")
+    except Exception as e:
+        traceback.print_exc()
+        logger.error(f"Error in executing: {e}")
+        await websocket.close(code=1011, reason="Internal server error")
+        
+        
+@app.post('/call')
+async def twilio_callback():
     try:
         response = VoiceResponse()
 
         connect = Connect()
-        websocket_twilio_route = f'{ws_url}/chat/v1/{agent_id}'
+        websocket_twilio_route = 'wss://polished-needlessly-monkfish.ngrok-free.app/chat'
         connect.stream(url=websocket_twilio_route)
         print(f"websocket connection done to {websocket_twilio_route}")
         response.append(connect)

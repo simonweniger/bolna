@@ -1,5 +1,5 @@
 import time
-from .base_manager import BaseManager
+import logging
 from .task_manager import TaskManager
 from bolna.helpers.logger_config import configure_logger
 from bolna.models import AGENT_WELCOME_MESSAGE
@@ -8,7 +8,7 @@ from bolna.helpers.utils import update_prompt_with_context
 logger = configure_logger(__name__)
 
 
-class AssistantManager(BaseManager):
+class AssistantManager():
     def __init__(self, agent_config, ws=None, assistant_id=None, context_data=None, conversation_history=None,
                  connected_through_dashboard=None, cache=None, input_queue=None, output_queue=None, **kwargs):
         super().__init__()
@@ -16,7 +16,7 @@ class AssistantManager(BaseManager):
         self.websocket = ws
         self.agent_config = agent_config
         self.context_data = context_data
-        self.tasks = agent_config.get('tasks', [])
+        self.tasks = agent_config.get('agent_config', {}).get('tasks', [])
         self.task_states = [False] * len(self.tasks)
         self.assistant_id = assistant_id
         self.run_id = f"{self.assistant_id}#{str(int(time.time() * 1000))}"
@@ -26,7 +26,7 @@ class AssistantManager(BaseManager):
         self.output_queue = output_queue
         self.kwargs = kwargs
         self.conversation_history = conversation_history
-        self.kwargs['agent_welcome_message'] = update_prompt_with_context(agent_config.get('agent_welcome_message', AGENT_WELCOME_MESSAGE), context_data)
+        self.kwargs['agent_welcome_message'] = update_prompt_with_context(agent_config.get('agent_config', {}).get('agent_welcome_message', AGENT_WELCOME_MESSAGE), context_data)
 
     async def run(self, local=False, run_id=None):
         """
@@ -34,6 +34,8 @@ class AssistantManager(BaseManager):
         """
         if run_id:
             self.run_id = run_id
+            
+        logging.info(f"Running tasks {self.tasks}")
 
         input_parameters = None
         for task_id, task in enumerate(self.tasks):
@@ -45,8 +47,8 @@ class AssistantManager(BaseManager):
                                        connected_through_dashboard=self.connected_through_dashboard,
                                        cache=self.cache, input_queue=self.input_queue, output_queue=self.output_queue,
                                        conversation_history=self.conversation_history, **self.kwargs)
-            await task_manager.load_prompt(self.agent_config.get("agent_name", self.agent_config.get("assistant_name")),
-                                           task_id, local=local, **self.kwargs)
+            
+            logging.info(f"Task Manager{task_manager}")
             task_output = await task_manager.run()
             task_output['run_id'] = self.run_id
             yield task_id, task_output.copy()
